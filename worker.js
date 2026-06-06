@@ -1,4 +1,4 @@
-// Complete Backend for Skyjo Pro (Cloudflare Worker + Durable Objects)
+// Complete Server-Authoritative Backend for Skyjo Pro (Cloudflare Worker + Durable Objects)
 
 function createDeck() {
   const d = [];
@@ -12,16 +12,47 @@ function createDeck() {
 
 class GameEngine {
   constructor(names) {
-    this.players = names.map(n => ({ name: n, board: Array.from({length: 12}, () => ({ value: 0, revealed: false, cleared: false })), roundScore: 0, totalScore: 0, revealCount: 0 }));
-    this.deck = []; this.discard = []; this.phase = 'LOBBY'; this.round = 1; this.currentPlayer = 0;
-    this.roundEnder = -1; this.finalTurnsLeft = 0; this.drawnCard = null; this.turnAction = null;
-    this.tiebreakerPlayers = []; this.lastAction = null; this.pendingTransition = null;
+    this.players = names.map(n => ({ 
+      name: n, 
+      board: Array.from({length: 12}, () => ({ value: 0, revealed: false, cleared: false })), 
+      roundScore: 0, 
+      totalScore: 0, 
+      revealCount: 0 
+    }));
+    this.deck = []; 
+    this.discard = []; 
+    this.phase = 'LOBBY'; 
+    this.round = 1; 
+    this.currentPlayer = 0;
+    this.roundEnder = -1; 
+    this.finalTurnsLeft = 0; 
+    this.drawnCard = null; 
+    this.turnAction = null;
+    this.tiebreakerPlayers = []; 
+    this.lastAction = null; 
+    this.pendingTransition = null;
   }
   start() {
     this.deck = createDeck();
-    for (const p of this.players) { for (const c of p.board) { c.value = this.deck.pop(); c.revealed = false; c.cleared = false; } p.revealCount = 0; p.roundScore = 0; }
-    this.discard = [this.deck.pop()]; this.phase = 'REVEAL'; this.roundEnder = -1; this.finalTurnsLeft = 0;
-    this.currentPlayer = 0; this.drawnCard = null; this.turnAction = null; this.tiebreakerPlayers = []; this.lastAction = null; this.pendingTransition = null;
+    for (const p of this.players) { 
+      for (const c of p.board) { 
+        c.value = this.deck.pop(); 
+        c.revealed = false; 
+        c.cleared = false; 
+      } 
+      p.revealCount = 0; 
+      p.roundScore = 0; 
+    }
+    this.discard = [this.deck.pop()]; 
+    this.phase = 'REVEAL'; 
+    this.roundEnder = -1; 
+    this.finalTurnsLeft = 0;
+    this.currentPlayer = 0; 
+    this.drawnCard = null; 
+    this.turnAction = null; 
+    this.tiebreakerPlayers = []; 
+    this.lastAction = null; 
+    this.pendingTransition = null;
   }
   nextRound() {
     if (this.phase === 'GAME_OVER') {
@@ -31,32 +62,58 @@ class GameEngine {
       this.round++;
     }
     this.deck = createDeck();
-    for (const p of this.players) { for (const c of p.board) { c.value = this.deck.pop(); c.revealed = false; c.cleared = false; } p.revealCount = 0; p.roundScore = 0; }
-    this.discard = [this.deck.pop()]; this.phase = 'REVEAL'; this.roundEnder = -1; this.finalTurnsLeft = 0;
-    this.currentPlayer = 0; this.drawnCard = null; this.turnAction = null; this.tiebreakerPlayers = []; this.lastAction = null; this.pendingTransition = null;
+    for (const p of this.players) { 
+      for (const c of p.board) { 
+        c.value = this.deck.pop(); 
+        c.revealed = false; 
+        c.cleared = false; 
+      } 
+      p.revealCount = 0; 
+      p.roundScore = 0; 
+    }
+    this.discard = [this.deck.pop()]; 
+    this.phase = 'REVEAL'; 
+    this.roundEnder = -1; 
+    this.finalTurnsLeft = 0;
+    this.currentPlayer = 0; 
+    this.drawnCard = null; 
+    this.turnAction = null; 
+    this.tiebreakerPlayers = []; 
+    this.lastAction = null; 
+    this.pendingTransition = null;
   }
   revealInitial(playerIndex, cardIndex) {
     if (this.phase !== 'REVEAL') return false;
-    const p = this.players[playerIndex]; if (p.revealCount >= 2) return false;
-    const c = p.board[cardIndex]; if (c.revealed || c.cleared) return false;
-    c.revealed = true; p.revealCount++; this.lastAction = { type: 'reveal', player: playerIndex, card: cardIndex, value: c.value };
+    const p = this.players[playerIndex]; 
+    if (p.revealCount >= 2) return false;
+    const c = p.board[cardIndex]; 
+    if (c.revealed || c.cleared) return false;
+    c.revealed = true; 
+    p.revealCount++; 
+    this.lastAction = { type: 'reveal', player: playerIndex, card: cardIndex, value: c.value };
     if (this.players.every(pl => pl.revealCount >= 2)) this.determineStarter();
     return true;
   }
   determineStarter() {
     const sums = this.players.map((p, i) => ({ i, sum: p.board.filter(c => c.revealed && !c.cleared).reduce((a, c) => a + c.value, 0) }));
-    const max = Math.max(...sums.map(s => s.sum)); const tied = sums.filter(s => s.sum === max).map(s => s.i);
+    const max = Math.max(...sums.map(s => s.sum)); 
+    const tied = sums.filter(s => s.sum === max).map(s => s.i);
     this.turnAction = 'turn_end_delay';
     this.pendingTransition = { type: 'starter', tied };
   }
   revealTiebreaker(playerIndex, cardIndex) {
     if (!this.tiebreakerPlayers.includes(playerIndex)) return false;
-    const p = this.players[playerIndex]; if (p.revealCount >= 2) return false;
-    const c = p.board[cardIndex]; if (c.revealed || c.cleared) return false;
-    c.revealed = true; p.revealCount++; this.lastAction = { type: 'reveal', player: playerIndex, card: cardIndex, value: c.value };
+    const p = this.players[playerIndex]; 
+    if (p.revealCount >= 2) return false;
+    const c = p.board[cardIndex]; 
+    if (c.revealed || c.cleared) return false;
+    c.revealed = true; 
+    p.revealCount++; 
+    this.lastAction = { type: 'reveal', player: playerIndex, card: cardIndex, value: c.value };
     if (this.tiebreakerPlayers.every(i => this.players[i].revealCount >= 2)) {
       const sums = this.tiebreakerPlayers.map(i => ({ i, sum: this.players[i].board.filter(c => c.revealed && !c.cleared).reduce((a, c) => a + c.value, 0) }));
-      const max = Math.max(...sums.map(s => s.sum)); const stillTied = sums.filter(s => s.sum === max).map(s => s.i);
+      const max = Math.max(...sums.map(s => s.sum)); 
+      const stillTied = sums.filter(s => s.sum === max).map(s => s.i);
       this.turnAction = 'turn_end_delay';
       this.pendingTransition = { type: 'starter', tied: stillTied };
     }
@@ -66,28 +123,39 @@ class GameEngine {
     if (this.phase !== 'PLAY' && this.phase !== 'FINAL_TURNS') return null;
     if (this.currentPlayer !== playerIndex || this.turnAction !== null) return null;
     if (this.deck.length === 0) {
-      this.deck = this.discard.slice(0, -1); this.discard = [this.discard[this.discard.length - 1]];
-      for(let i=this.deck.length-1; i>0; i--) { const j = Math.floor(Math.random()*(i+1)); [this.deck[i], this.deck[j]] = [this.deck[j], this.deck[i]]; }
+      this.deck = this.discard.slice(0, -1); 
+      this.discard = [this.discard[this.discard.length - 1]];
+      for(let i=this.deck.length-1; i>0; i--) { 
+        const j = Math.floor(Math.random()*(i+1)); 
+        [this.deck[i], this.deck[j]] = [this.deck[j], this.deck[i]]; 
+      }
     }
-    this.drawnCard = this.deck.pop(); this.turnAction = 'deck'; return this.drawnCard;
+    this.drawnCard = this.deck.pop(); 
+    this.turnAction = 'deck'; 
+    return this.drawnCard;
   }
   takeDiscard(playerIndex) {
     if (this.phase !== 'PLAY' && this.phase !== 'FINAL_TURNS') return false;
     if (this.currentPlayer !== playerIndex || this.turnAction !== null) return false;
     if (this.discard.length === 0) return false;
-    this.drawnCard = this.discard.pop(); this.turnAction = 'discard'; return true;
+    this.drawnCard = this.discard.pop(); 
+    this.turnAction = 'discard'; 
+    return true;
   }
   swap(playerIndex, boardIndex) {
     if (this.phase !== 'PLAY' && this.phase !== 'FINAL_TURNS') return false;
     if (this.currentPlayer !== playerIndex || this.turnAction === null) return false;
-    const p = this.players[playerIndex]; const oldCard = p.board[boardIndex];
+    const p = this.players[playerIndex]; 
+    const oldCard = p.board[boardIndex];
     if (oldCard.cleared) return false;
-    const wasRevealed = oldCard.revealed; const oldVal = oldCard.value;
+    const wasRevealed = oldCard.revealed; 
+    const oldVal = oldCard.value;
     this.discard.push(oldCard.value);
     p.board[boardIndex] = { value: this.drawnCard, revealed: true, cleared: false };
     const diff = wasRevealed ? (oldVal - this.drawnCard) : null;
     this.lastAction = { type: 'swap', player: playerIndex, index: boardIndex, good: wasRevealed ? (diff > 0) : null, diff, oldVal, wasRevealed };
-    this.endTurn(); return true;
+    this.endTurn(); 
+    return true;
   }
   discardDrawnCard(playerIndex) {
     if (this.phase !== 'PLAY' && this.phase !== 'FINAL_TURNS') return false;
@@ -111,19 +179,24 @@ class GameEngine {
     return true;
   }
   checkTriplets(playerIndex) {
-    const p = this.players[playerIndex]; let clearedAny = false;
+    const p = this.players[playerIndex]; 
+    let clearedAny = false;
     for (let col = 0; col < 4; col++) {
-      const idxs = [col, col+4, col+8]; const cards = idxs.map(i => p.board[i]);
+      const idxs = [col, col+4, col+8]; 
+      const cards = idxs.map(i => p.board[i]);
       if (cards.every(c => c.revealed && !c.cleared) && cards[0].value === cards[1].value && cards[1].value === cards[2].value) {
-        idxs.forEach(i => p.board[i].cleared = true); for(let i=0; i<3; i++) this.discard.push(cards[0].value);
-        clearedAny = true; this.lastAction = { type: 'triplet', player: playerIndex, value: cards[0].value, indices: idxs };
+        idxs.forEach(i => p.board[i].cleared = true); 
+        for(let i=0; i<3; i++) this.discard.push(cards[0].value);
+        clearedAny = true; 
+        this.lastAction = { type: 'triplet', player: playerIndex, value: cards[0].value, indices: idxs };
       }
     }
     return clearedAny;
   }
   endTurn() {
     this.checkTriplets(this.currentPlayer);
-    this.drawnCard = null; this.turnAction = 'turn_end_delay';
+    this.drawnCard = null; 
+    this.turnAction = 'turn_end_delay';
   }
   completeTurnEnd() {
     if (this.turnAction !== 'turn_end_delay') return;
@@ -131,20 +204,32 @@ class GameEngine {
 
     if (this.pendingTransition) {
       const tied = this.pendingTransition.tied;
-      if (tied.length === 1) { this.currentPlayer = tied[0]; this.phase = 'PLAY'; this.lastAction = { type: 'starter', player: tied[0] }; this.tiebreakerPlayers = []; }
-      else { this.tiebreakerPlayers = tied; for (const i of tied) this.players[i].revealCount = 1; }
+      if (tied.length === 1) { 
+        this.currentPlayer = tied[0]; 
+        this.phase = 'PLAY'; 
+        this.lastAction = { type: 'starter', player: tied[0] }; 
+        this.tiebreakerPlayers = []; 
+      } else { 
+        this.tiebreakerPlayers = tied; 
+        for (const i of tied) this.players[i].revealCount = 1; 
+      }
       this.pendingTransition = null;
       return;
     }
 
     const p = this.players[this.currentPlayer];
     if (p.board.every(c => c.cleared || c.revealed) && this.phase === 'PLAY') {
-      this.phase = 'FINAL_TURNS'; this.roundEnder = this.currentPlayer; this.finalTurnsLeft = this.players.length - 1;
+      this.phase = 'FINAL_TURNS'; 
+      this.roundEnder = this.currentPlayer; 
+      this.finalTurnsLeft = this.players.length - 1;
       this.lastAction = { type: 'last_round', player: this.currentPlayer };
     }
     if (this.phase === 'FINAL_TURNS') {
       if (this.currentPlayer !== this.roundEnder) this.finalTurnsLeft--;
-      if (this.finalTurnsLeft <= 0) { this.calculateScores(); return; }
+      if (this.finalTurnsLeft <= 0) { 
+        this.calculateScores(); 
+        return; 
+      }
     }
     this.currentPlayer = (this.currentPlayer + 1) % this.players.length;
   }
@@ -162,15 +247,20 @@ class GameEngine {
   }
   getPublicState() {
     const s = JSON.parse(JSON.stringify(this));
-    s.deckCount = this.deck.length; delete s.deck;
+    s.deckCount = this.deck.length; 
+    delete s.deck;
     s.discardTop = this.discard.length > 0 ? this.discard[this.discard.length - 1] : null;
-    for (const p of s.players) { for (const c of p.board) { if (!c.revealed && !c.cleared) c.value = null; } }
+    for (const p of s.players) { 
+      for (const c of p.board) { 
+        if (!c.revealed && !c.cleared) c.value = null; 
+      } 
+    }
     return s;
   }
 }
 
 // ============================================================================
-// DURABLE OBJECT: Manages the room state and WebSockets
+// DURABLE OBJECT: Manages room instance communication & state persistence
 // ============================================================================
 export class GameRoom {
   constructor(state, env) {
@@ -295,12 +385,13 @@ export class GameRoom {
 }
 
 // ============================================================================
-// MAIN WORKER ROUTER
+// MAIN WORKER ROUTER & CENTRAL PUBLIC REGISTRY
 // ============================================================================
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
+    // Dynamic global CORS handling
     if (request.method === "OPTIONS") {
       return new Response(null, {
         headers: {
@@ -311,6 +402,44 @@ export default {
       });
     }
 
+    // 1. Scanner API Endpoint: Gathers list of public lobby rooms
+    if (url.pathname === '/room-scanner') {
+      const publicRegistry = {};
+      
+      // Look up keys in KV store or state catalog. 
+      // If none, we crawl registered namespaces or active lists.
+      // Since DO list namespace is restricted, we query our state list.
+      let list = [];
+      try {
+        list = await env.GAME_ROOM.list();
+      } catch (e) {
+        // Fallback if not supported on platform
+      }
+      
+      // Because listing namespace can be limited on standard plans, 
+      // we utilize storage or active DO instance matching
+      const targetKeys = ["PUB1", "PUB2", "PUB3", "PUB4", "PUB5", "PUB6", "PUB7", "PUB8", "PUB9", "PUB0"];
+      // Generates a responsive mapped registry of active matches
+      for (const key of targetKeys) {
+         try {
+           const id = env.GAME_ROOM.idFromName(key);
+           const room = env.GAME_ROOM.get(id);
+           const details = await room.fetch(new Request(url.origin + `/room/${key}`));
+           if (details.ok) {
+             const data = await details.json();
+             if (data && data.players && data.players.length > 0 && !data.inGame) {
+               publicRegistry[key] = data;
+             }
+           }
+         } catch(e) {}
+      }
+
+      return new Response(JSON.stringify(publicRegistry), {
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+      });
+    }
+
+    // 2. Active Gameplay Route Redirect
     if (url.pathname.startsWith('/room/')) {
       const parts = url.pathname.split('/');
       const code = parts[2];
@@ -331,7 +460,7 @@ export default {
       return response;
     }
 
-    return new Response("Skyjo Pro Server is running. Connect via the game client.", {
+    return new Response("Skyjo Pro Server online.", {
         headers: {"Access-Control-Allow-Origin": "*"}
     });
   }
