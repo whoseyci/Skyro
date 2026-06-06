@@ -24,7 +24,13 @@ class GameEngine {
     this.currentPlayer = 0; this.drawnCard = null; this.turnAction = null; this.tiebreakerPlayers = []; this.lastAction = null; this.pendingTransition = null;
   }
   nextRound() {
-    this.round++; this.deck = createDeck();
+    if (this.phase === 'GAME_OVER') {
+      for (const p of this.players) p.totalScore = 0;
+      this.round = 1;
+    } else {
+      this.round++;
+    }
+    this.deck = createDeck();
     for (const p of this.players) { for (const c of p.board) { c.value = this.deck.pop(); c.revealed = false; c.cleared = false; } p.revealCount = 0; p.roundScore = 0; }
     this.discard = [this.deck.pop()]; this.phase = 'REVEAL'; this.roundEnder = -1; this.finalTurnsLeft = 0;
     this.currentPlayer = 0; this.drawnCard = null; this.turnAction = null; this.tiebreakerPlayers = []; this.lastAction = null; this.pendingTransition = null;
@@ -134,6 +140,7 @@ class GameEngine {
     const p = this.players[this.currentPlayer];
     if (p.board.every(c => c.cleared || c.revealed) && this.phase === 'PLAY') {
       this.phase = 'FINAL_TURNS'; this.roundEnder = this.currentPlayer; this.finalTurnsLeft = this.players.length - 1;
+      this.lastAction = { type: 'last_round', player: this.currentPlayer };
     }
     if (this.phase === 'FINAL_TURNS') {
       if (this.currentPlayer !== this.roundEnder) this.finalTurnsLeft--;
@@ -172,7 +179,6 @@ export class GameRoom {
     this.sessions = [];
     this.game = new GameEngine([]);
     
-    // Attempt to recover game state from Cloudflare storage if the Worker restarted
     this.state.blockConcurrencyWhile(async () => {
       let stored = await this.state.storage.get("gameState");
       if (stored) {
@@ -184,7 +190,6 @@ export class GameRoom {
   async fetch(request) {
     const url = new URL(request.url);
 
-    // REST Endpoint: Returns basic room info for the lobby browser
     if (!url.pathname.endsWith('/ws')) {
       const resp = {
         hostName: this.sessions.length > 0 ? this.sessions[0].name : "Waiting...",
@@ -196,7 +201,6 @@ export class GameRoom {
       });
     }
 
-    // WebSocket Upgrade Endpoint: Handles real-time gameplay
     if (request.headers.get("Upgrade") !== "websocket") {
       return new Response("Expected Upgrade: websocket", { status: 426 });
     }
@@ -208,7 +212,6 @@ export class GameRoom {
     this.state.acceptWebSocket(server);
     this.sessions.push({ ws: server, name: playerName, isPublic });
 
-    // Send the player into the game if it already started, otherwise update lobby
     if (this.game.phase !== 'LOBBY' && this.game.phase !== 'GAME_OVER') {
         this.broadcastState();
     } else {
@@ -237,7 +240,6 @@ export class GameRoom {
     if (data.type === 'action') {
       const action = data.action;
       
-      // Handle private actions that only the active player should know about
       if (action === 'draw_deck') {
         const drawn = this.game.drawDeck(playerIndex);
         if (drawn !== null) ws.send(JSON.stringify({ type: 'your_draw', value: drawn }));
@@ -246,7 +248,6 @@ export class GameRoom {
         const success = this.game.takeDiscard(playerIndex);
         if (success) ws.send(JSON.stringify({ type: 'your_draw', value: this.game.drawnCard }));
       }
-      // Handle public board actions
       else if (action === 'reveal') this.game.revealInitial(playerIndex, data.index);
       else if (action === 'tiebreaker') this.game.revealTiebreaker(playerIndex, data.index);
       else if (action === 'swap') this.game.swap(playerIndex, data.index);
@@ -262,8 +263,6 @@ export class GameRoom {
 
   webSocketClose(ws, code, reason, wasClean) {
     this.sessions = this.sessions.filter(s => s.ws !== ws);
-    // If we're in the lobby, inform others that someone left. 
-    // If in game, we just keep their spot open for reconnection.
     if (this.game.phase === 'LOBBY' || this.game.phase === 'GAME_OVER') {
       this.broadcastLobby();
     }
@@ -296,13 +295,12 @@ export class GameRoom {
 }
 
 // ============================================================================
-// MAIN WORKER ROUTER: Intercepts the HTTP request and sends to Durable Object
+// MAIN WORKER ROUTER
 // ============================================================================
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    // Global CORS handling for frontend requests
     if (request.method === "OPTIONS") {
       return new Response(null, {
         headers: {
@@ -324,12 +322,10 @@ export default {
         );
       }
 
-      // Forward request to the specific room's instance
       const id = env.GAME_ROOM.idFromName(code);
       const room = env.GAME_ROOM.get(id);
       
       let response = await room.fetch(request);
-      // Append CORS to the Durable Object's response
       response = new Response(response.body, response);
       response.headers.set("Access-Control-Allow-Origin", "*");
       return response;
