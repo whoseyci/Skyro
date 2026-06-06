@@ -1,467 +1,362 @@
-// Complete Server-Authoritative Backend for Skyjo Pro (Cloudflare Worker + Durable Objects)
+/**
+ * Skyjo Server — built with partyserver on Cloudflare Workers
+ *
+ * partyserver wraps Durable Objects with a clean WebSocket API.
+ * Routing: partysocket on the client hits  /parties/skyjo-room/:roomCode
+ * which routePartykitRequest maps to the SkyjoRoom DO by name.
+ *
+ * Cost savers:
+ *  • hibernate: true  → DO sleeps between messages, zero duration charges
+ *  • Outgoing broadcasts are FREE on Cloudflare
+ *  • Incoming messages billed 20:1 (a full game ≈ 5-10 billed requests)
+ *  • No storage writes during gameplay (game state is in-memory JS)
+ *  • ctx.storage.setAlarm() closes abandoned rooms after 10 min
+ */
+
+import { Server, routePartykitRequest } from "partyserver";
+
+// ─── Tiny Game Engine (server is authoritative) ──────────────────────────────
+
+function shuffle(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
 
 function createDeck() {
   const d = [];
-  for(let i=0; i<5; i++) d.push(-2);
-  for(let i=0; i<10; i++) d.push(-1);
-  for(let i=0; i<15; i++) d.push(0);
-  for(let v=1; v<=12; v++) { for(let i=0; i<10; i++) d.push(v); }
-  for(let i=d.length-1; i>0; i--) { const j = Math.floor(Math.random()*(i+1)); [d[i], d[j]] = [d[j], d[i]]; }
-  return d;
+  for (let i = 0; i < 5; i++) d.push(-2);
+  for (let i = 0; i < 10; i++) d.push(-1);
+  for (let i = 0; i < 15; i++) d.push(0);
+  for (let v = 1; v <= 12; v++) for (let i = 0; i < 10; i++) d.push(v);
+  return shuffle(d);
 }
 
 class GameEngine {
   constructor(names) {
-    this.players = names.map(n => ({ 
-      name: n, 
-      board: Array.from({length: 12}, () => ({ value: 0, revealed: false, cleared: false })), 
-      roundScore: 0, 
-      totalScore: 0, 
-      revealCount: 0 
+    this.players = names.map(n => ({
+      name: n,
+      board: Array.from({ length: 12 }, () => ({ value: 0, revealed: false, cleared: false })),
+      roundScore: 0, totalScore: 0, revealCount: 0,
     }));
-    this.deck = []; 
-    this.discard = []; 
-    this.phase = 'LOBBY'; 
-    this.round = 1; 
-    this.currentPlayer = 0;
-    this.roundEnder = -1; 
-    this.finalTurnsLeft = 0; 
-    this.drawnCard = null; 
-    this.turnAction = null;
-    this.tiebreakerPlayers = []; 
-    this.lastAction = null; 
-    this.pendingTransition = null;
+    this.deck = []; this.discard = [];
+    this.phase = 'LOBBY'; this.round = 1;
+    this.currentPlayer = 0; this.roundEnder = -1; this.finalTurnsLeft = 0;
+    this.drawnCard = null; this.turnAction = null;
+    this.tiebreakerPlayers = []; this.pendingTransition = null;
   }
-  start() {
+
+  _deal() {
     this.deck = createDeck();
-    for (const p of this.players) { 
-      for (const c of p.board) { 
-        c.value = this.deck.pop(); 
-        c.revealed = false; 
-        c.cleared = false; 
-      } 
-      p.revealCount = 0; 
-      p.roundScore = 0; 
+    for (const p of this.players) {
+      for (const c of p.board) { c.value = this.deck.pop(); c.revealed = false; c.cleared = false; }
+      p.revealCount = 0; p.roundScore = 0;
     }
-    this.discard = [this.deck.pop()]; 
-    this.phase = 'REVEAL'; 
-    this.roundEnder = -1; 
-    this.finalTurnsLeft = 0;
-    this.currentPlayer = 0; 
-    this.drawnCard = null; 
-    this.turnAction = null; 
-    this.tiebreakerPlayers = []; 
-    this.lastAction = null; 
-    this.pendingTransition = null;
+    this.discard = [this.deck.pop()];
+    this.roundEnder = -1; this.finalTurnsLeft = 0;
+    this.currentPlayer = 0; this.drawnCard = null; this.turnAction = null;
+    this.tiebreakerPlayers = []; this.pendingTransition = null;
   }
-  nextRound() {
-    if (this.phase === 'GAME_OVER') {
-      for (const p of this.players) p.totalScore = 0;
-      this.round = 1;
-    } else {
-      this.round++;
-    }
-    this.deck = createDeck();
-    for (const p of this.players) { 
-      for (const c of p.board) { 
-        c.value = this.deck.pop(); 
-        c.revealed = false; 
-        c.cleared = false; 
-      } 
-      p.revealCount = 0; 
-      p.roundScore = 0; 
-    }
-    this.discard = [this.deck.pop()]; 
-    this.phase = 'REVEAL'; 
-    this.roundEnder = -1; 
-    this.finalTurnsLeft = 0;
-    this.currentPlayer = 0; 
-    this.drawnCard = null; 
-    this.turnAction = null; 
-    this.tiebreakerPlayers = []; 
-    this.lastAction = null; 
-    this.pendingTransition = null;
-  }
-  revealInitial(playerIndex, cardIndex) {
+
+  start() { this._deal(); this.phase = 'REVEAL'; this.round = 1; }
+  nextRound() { this.round++; this._deal(); this.phase = 'REVEAL'; }
+
+  revealInitial(pi, ci) {
     if (this.phase !== 'REVEAL') return false;
-    const p = this.players[playerIndex]; 
-    if (p.revealCount >= 2) return false;
-    const c = p.board[cardIndex]; 
-    if (c.revealed || c.cleared) return false;
-    c.revealed = true; 
-    p.revealCount++; 
-    this.lastAction = { type: 'reveal', player: playerIndex, card: cardIndex, value: c.value };
-    if (this.players.every(pl => pl.revealCount >= 2)) this.determineStarter();
+    const p = this.players[pi]; if (p.revealCount >= 2) return false;
+    const c = p.board[ci]; if (c.revealed || c.cleared) return false;
+    c.revealed = true; p.revealCount++;
+    if (this.players.every(pl => pl.revealCount >= 2)) this._pickStarter();
     return true;
   }
-  determineStarter() {
-    const sums = this.players.map((p, i) => ({ i, sum: p.board.filter(c => c.revealed && !c.cleared).reduce((a, c) => a + c.value, 0) }));
-    const max = Math.max(...sums.map(s => s.sum)); 
-    const tied = sums.filter(s => s.sum === max).map(s => s.i);
+
+  _pickStarter() {
+    const sums = this.players.map((p, i) => ({ i, s: p.board.filter(c => c.revealed).reduce((a, c) => a + c.value, 0) }));
+    const max = Math.max(...sums.map(x => x.s));
+    const tied = sums.filter(x => x.s === max).map(x => x.i);
     this.turnAction = 'turn_end_delay';
     this.pendingTransition = { type: 'starter', tied };
   }
-  revealTiebreaker(playerIndex, cardIndex) {
-    if (!this.tiebreakerPlayers.includes(playerIndex)) return false;
-    const p = this.players[playerIndex]; 
-    if (p.revealCount >= 2) return false;
-    const c = p.board[cardIndex]; 
+
+  revealTiebreaker(pi, ci) {
+    if (!this.tiebreakerPlayers.includes(pi)) return false;
+    const p = this.players[pi]; const c = p.board[ci];
     if (c.revealed || c.cleared) return false;
-    c.revealed = true; 
-    p.revealCount++; 
-    this.lastAction = { type: 'reveal', player: playerIndex, card: cardIndex, value: c.value };
+    c.revealed = true; p.revealCount++;
     if (this.tiebreakerPlayers.every(i => this.players[i].revealCount >= 2)) {
-      const sums = this.tiebreakerPlayers.map(i => ({ i, sum: this.players[i].board.filter(c => c.revealed && !c.cleared).reduce((a, c) => a + c.value, 0) }));
-      const max = Math.max(...sums.map(s => s.sum)); 
-      const stillTied = sums.filter(s => s.sum === max).map(s => s.i);
-      this.turnAction = 'turn_end_delay';
-      this.pendingTransition = { type: 'starter', tied: stillTied };
+      const sums = this.tiebreakerPlayers.map(i => ({ i, s: this.players[i].board.filter(c => c.revealed).reduce((a, c) => a + c.value, 0) }));
+      const max = Math.max(...sums.map(x => x.s)); const tied = sums.filter(x => x.s === max).map(x => x.i);
+      this.turnAction = 'turn_end_delay'; this.pendingTransition = { type: 'starter', tied };
     }
     return true;
   }
-  drawDeck(playerIndex) {
-    if (this.phase !== 'PLAY' && this.phase !== 'FINAL_TURNS') return null;
-    if (this.currentPlayer !== playerIndex || this.turnAction !== null) return null;
-    if (this.deck.length === 0) {
-      this.deck = this.discard.slice(0, -1); 
-      this.discard = [this.discard[this.discard.length - 1]];
-      for(let i=this.deck.length-1; i>0; i--) { 
-        const j = Math.floor(Math.random()*(i+1)); 
-        [this.deck[i], this.deck[j]] = [this.deck[j], this.deck[i]]; 
-      }
-    }
-    this.drawnCard = this.deck.pop(); 
-    this.turnAction = 'deck'; 
+
+  drawDeck(pi) {
+    if (!['PLAY','FINAL_TURNS'].includes(this.phase)) return null;
+    if (this.currentPlayer !== pi || this.turnAction !== null) return null;
+    if (this.deck.length === 0) { this.deck = shuffle(this.discard.slice(0,-1)); this.discard = [this.discard[this.discard.length-1]]; }
+    this.drawnCard = this.deck.pop(); this.turnAction = 'deck';
     return this.drawnCard;
   }
-  takeDiscard(playerIndex) {
-    if (this.phase !== 'PLAY' && this.phase !== 'FINAL_TURNS') return false;
-    if (this.currentPlayer !== playerIndex || this.turnAction !== null) return false;
-    if (this.discard.length === 0) return false;
-    this.drawnCard = this.discard.pop(); 
-    this.turnAction = 'discard'; 
-    return true;
+
+  takeDiscard(pi) {
+    if (!['PLAY','FINAL_TURNS'].includes(this.phase)) return null;
+    if (this.currentPlayer !== pi || this.turnAction !== null) return null;
+    if (!this.discard.length) return null;
+    const val = this.discard[this.discard.length - 1]; // capture BEFORE pop
+    this.drawnCard = this.discard.pop(); this.turnAction = 'discard';
+    return val; // return captured value (same as drawnCard now, but semantically clear)
   }
-  swap(playerIndex, boardIndex) {
-    if (this.phase !== 'PLAY' && this.phase !== 'FINAL_TURNS') return false;
-    if (this.currentPlayer !== playerIndex || this.turnAction === null) return false;
-    const p = this.players[playerIndex]; 
-    const oldCard = p.board[boardIndex];
-    if (oldCard.cleared) return false;
-    const wasRevealed = oldCard.revealed; 
-    const oldVal = oldCard.value;
-    this.discard.push(oldCard.value);
-    p.board[boardIndex] = { value: this.drawnCard, revealed: true, cleared: false };
-    const diff = wasRevealed ? (oldVal - this.drawnCard) : null;
-    this.lastAction = { type: 'swap', player: playerIndex, index: boardIndex, good: wasRevealed ? (diff > 0) : null, diff, oldVal, wasRevealed };
-    this.endTurn(); 
-    return true;
+
+  swap(pi, bi) {
+    if (!['PLAY','FINAL_TURNS'].includes(this.phase) || this.currentPlayer !== pi || !this.turnAction) return false;
+    const p = this.players[pi]; const old = p.board[bi]; if (old.cleared) return false;
+    this.discard.push(old.value);
+    p.board[bi] = { value: this.drawnCard, revealed: true, cleared: false };
+    this._checkTriplets(pi); this._finishTurn(); return true;
   }
-  discardDrawnCard(playerIndex) {
-    if (this.phase !== 'PLAY' && this.phase !== 'FINAL_TURNS') return false;
-    if (this.currentPlayer !== playerIndex || this.turnAction !== 'deck') return false;
-    this.discard.push(this.drawnCard);
-    this.drawnCard = null;
-    this.turnAction = 'must_reveal';
-    this.lastAction = { type: 'discard_drawn', player: playerIndex };
-    return true;
+
+  discardDrawn(pi) {
+    if (!['PLAY','FINAL_TURNS'].includes(this.phase) || this.currentPlayer !== pi || this.turnAction !== 'deck') return false;
+    this.discard.push(this.drawnCard); this.drawnCard = null; this.turnAction = 'must_reveal'; return true;
   }
-  revealAfterDiscard(playerIndex, boardIndex) {
-    if (this.phase !== 'PLAY' && this.phase !== 'FINAL_TURNS') return false;
-    if (this.currentPlayer !== playerIndex || this.turnAction !== 'must_reveal') return false;
-    const p = this.players[playerIndex];
-    const targetCard = p.board[boardIndex];
-    if (targetCard.revealed || targetCard.cleared) return false;
-    
-    targetCard.revealed = true;
-    this.lastAction = { type: 'reveal_after_discard', player: playerIndex, index: boardIndex, value: targetCard.value };
-    this.endTurn();
-    return true;
+
+  revealAfterDiscard(pi, bi) {
+    if (!['PLAY','FINAL_TURNS'].includes(this.phase) || this.currentPlayer !== pi || this.turnAction !== 'must_reveal') return false;
+    const c = this.players[pi].board[bi]; if (c.revealed || c.cleared) return false;
+    c.revealed = true; this._checkTriplets(pi); this._finishTurn(); return true;
   }
-  checkTriplets(playerIndex) {
-    const p = this.players[playerIndex]; 
-    let clearedAny = false;
+
+  _checkTriplets(pi) {
+    const p = this.players[pi];
     for (let col = 0; col < 4; col++) {
-      const idxs = [col, col+4, col+8]; 
-      const cards = idxs.map(i => p.board[i]);
+      const idxs = [col, col+4, col+8]; const cards = idxs.map(i => p.board[i]);
       if (cards.every(c => c.revealed && !c.cleared) && cards[0].value === cards[1].value && cards[1].value === cards[2].value) {
-        idxs.forEach(i => p.board[i].cleared = true); 
-        for(let i=0; i<3; i++) this.discard.push(cards[0].value);
-        clearedAny = true; 
-        this.lastAction = { type: 'triplet', player: playerIndex, value: cards[0].value, indices: idxs };
+        idxs.forEach(i => { p.board[i].cleared = true; this.discard.push(cards[0].value); });
       }
     }
-    return clearedAny;
   }
-  endTurn() {
-    this.checkTriplets(this.currentPlayer);
-    this.drawnCard = null; 
-    this.turnAction = 'turn_end_delay';
-  }
+
+  _finishTurn() { this.drawnCard = null; this.turnAction = 'turn_end_delay'; }
+
   completeTurnEnd() {
     if (this.turnAction !== 'turn_end_delay') return;
     this.turnAction = null;
-
     if (this.pendingTransition) {
-      const tied = this.pendingTransition.tied;
-      if (tied.length === 1) { 
-        this.currentPlayer = tied[0]; 
-        this.phase = 'PLAY'; 
-        this.lastAction = { type: 'starter', player: tied[0] }; 
-        this.tiebreakerPlayers = []; 
-      } else { 
-        this.tiebreakerPlayers = tied; 
-        for (const i of tied) this.players[i].revealCount = 1; 
-      }
-      this.pendingTransition = null;
+      const { tied } = this.pendingTransition; this.pendingTransition = null;
+      if (tied.length === 1) { this.currentPlayer = tied[0]; this.phase = 'PLAY'; this.tiebreakerPlayers = []; }
+      else { this.tiebreakerPlayers = tied; for (const i of tied) this.players[i].revealCount = 1; }
       return;
     }
-
     const p = this.players[this.currentPlayer];
     if (p.board.every(c => c.cleared || c.revealed) && this.phase === 'PLAY') {
-      this.phase = 'FINAL_TURNS'; 
-      this.roundEnder = this.currentPlayer; 
-      this.finalTurnsLeft = this.players.length - 1;
-      this.lastAction = { type: 'last_round', player: this.currentPlayer };
+      this.phase = 'FINAL_TURNS'; this.roundEnder = this.currentPlayer; this.finalTurnsLeft = this.players.length - 1;
     }
     if (this.phase === 'FINAL_TURNS') {
       if (this.currentPlayer !== this.roundEnder) this.finalTurnsLeft--;
-      if (this.finalTurnsLeft <= 0) { 
-        this.calculateScores(); 
-        return; 
-      }
+      if (this.finalTurnsLeft <= 0) { this._calcScores(); return; }
     }
     this.currentPlayer = (this.currentPlayer + 1) % this.players.length;
   }
-  calculateScores() {
+
+  _calcScores() {
     for (const p of this.players) {
-      for (const c of p.board) { if (!c.cleared) c.revealed = true; }
-      this.checkTriplets(this.players.indexOf(p));
-      p.roundScore = p.board.filter(c => !c.cleared).reduce((sum, c) => sum + c.value, 0);
+      for (const c of p.board) if (!c.cleared) c.revealed = true;
+      this._checkTriplets(this.players.indexOf(p));
+      p.roundScore = p.board.filter(c => !c.cleared).reduce((s, c) => s + c.value, 0);
     }
     const ender = this.players[this.roundEnder];
-    const minOther = Math.min(...this.players.filter((_, i) => i !== this.roundEnder).map(o => o.roundScore));
+    const minOther = Math.min(...this.players.filter((_,i) => i !== this.roundEnder).map(o => o.roundScore));
     if (ender.roundScore >= minOther && ender.roundScore > 0) ender.roundScore *= 2;
     for (const p of this.players) p.totalScore += p.roundScore;
     this.phase = this.players.some(p => p.totalScore >= 100) ? 'GAME_OVER' : 'ROUND_END';
   }
-  getPublicState() {
+
+  publicState() {
     const s = JSON.parse(JSON.stringify(this));
-    s.deckCount = this.deck.length; 
-    delete s.deck;
-    s.discardTop = this.discard.length > 0 ? this.discard[this.discard.length - 1] : null;
-    for (const p of s.players) { 
-      for (const c of p.board) { 
-        if (!c.revealed && !c.cleared) c.value = null; 
-      } 
-    }
+    s.deckCount = this.deck.length; delete s.deck;
+    s.discardTop = this.discard.length ? this.discard[this.discard.length - 1] : null;
+    for (const p of s.players) for (const c of p.board) if (!c.revealed && !c.cleared) c.value = null;
     return s;
   }
 }
 
-// ============================================================================
-// DURABLE OBJECT: Manages room instance communication & state persistence
-// ============================================================================
-export class GameRoom {
-  constructor(state, env) {
-    this.state = state;
-    this.env = env;
-    this.sessions = [];
-    this.game = new GameEngine([]);
-    
-    this.state.blockConcurrencyWhile(async () => {
-      let stored = await this.state.storage.get("gameState");
-      if (stored) {
-        Object.assign(this.game, stored);
+// ─── PartyServer Room ────────────────────────────────────────────────────────
+
+const INACTIVITY_MS = 10 * 60 * 1000;
+const TURN_DELAY_MS = 1500;
+
+export class SkyjoRoom extends Server {
+  static options = { hibernate: true }; // free-tier saver: sleep between messages
+
+  constructor(ctx, env) {
+    super(ctx, env);
+    this.game = null;
+    this.lobby = {}; // name -> connId
+    this.hostName = null;
+    this.isPublic = false;
+  }
+
+  onStart() {
+    // Reset inactivity alarm on wake
+    this.ctx.storage.setAlarm(Date.now() + INACTIVITY_MS);
+  }
+
+  onConnect(conn, ctx) {
+    const url = new URL(ctx.request.url);
+    const playerName = decodeURIComponent(url.searchParams.get('name') || 'Player');
+    const wantsPublic = url.searchParams.get('public') === '1';
+
+    conn.setState({ name: playerName });
+
+    if (!this.hostName) { this.hostName = playerName; this.isPublic = wantsPublic; }
+    this.lobby[playerName] = conn.id;
+
+    this.ctx.storage.setAlarm(Date.now() + INACTIVITY_MS);
+
+    // Send lobby state to all (including newcomer)
+    this._broadcastLobby();
+
+    // If game is running, send current state to the new connection
+    if (this.game && this.game.phase !== 'LOBBY') {
+      conn.send(JSON.stringify({ type: 'state', state: this.game.publicState() }));
+    }
+  }
+
+  onMessage(conn, raw) {
+    this.ctx.storage.setAlarm(Date.now() + INACTIVITY_MS);
+
+    let msg; try { msg = JSON.parse(raw); } catch { return; }
+    const playerName = conn.state?.name;
+    if (!playerName) return;
+
+    switch (msg.type) {
+      case 'ping': conn.send(JSON.stringify({ type: 'pong' })); break;
+
+      case 'set_public': {
+        if (playerName !== this.hostName) return;
+        this.isPublic = !!msg.value;
+        this._broadcastLobby();
+        break;
       }
-    });
-  }
 
-  async fetch(request) {
-    const url = new URL(request.url);
-
-    if (!url.pathname.endsWith('/ws')) {
-      const resp = {
-        hostName: this.sessions.length > 0 ? this.sessions[0].name : "Waiting...",
-        inGame: this.game.phase !== 'LOBBY' && this.game.phase !== 'GAME_OVER',
-        players: this.sessions.map(s => s.name)
-      };
-      return new Response(JSON.stringify(resp), { 
-        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } 
-      });
-    }
-
-    if (request.headers.get("Upgrade") !== "websocket") {
-      return new Response("Expected Upgrade: websocket", { status: 426 });
-    }
-
-    const { 0: client, 1: server } = new WebSocketPair();
-    const playerName = url.searchParams.get("name") || "Unknown";
-    const isPublic = url.searchParams.get("public") === "1";
-
-    this.state.acceptWebSocket(server);
-    this.sessions.push({ ws: server, name: playerName, isPublic });
-
-    if (this.game.phase !== 'LOBBY' && this.game.phase !== 'GAME_OVER') {
-        this.broadcastState();
-    } else {
-        this.broadcastLobby();
-    }
-
-    return new Response(null, { status: 101, webSocket: client });
-  }
-
-  async webSocketMessage(ws, msg) {
-    const data = JSON.parse(msg);
-    if (data.type === 'ping') return;
-
-    const session = this.sessions.find(s => s.ws === ws);
-    if (!session) return;
-    const playerIndex = this.sessions.indexOf(session);
-
-    if (data.type === 'host_start' && playerIndex === 0) {
-      this.game = new GameEngine(this.sessions.map(s => s.name));
-      this.game.start();
-      this.saveState();
-      this.broadcastState();
-      return;
-    }
-
-    if (data.type === 'action') {
-      const action = data.action;
-      
-      if (action === 'draw_deck') {
-        const drawn = this.game.drawDeck(playerIndex);
-        if (drawn !== null) ws.send(JSON.stringify({ type: 'your_draw', value: drawn }));
+      case 'host_start': {
+        if (playerName !== this.hostName) return;
+        const names = Object.keys(this.lobby);
+        if (names.length < 2) { conn.send(JSON.stringify({ type: 'error', msg: 'Need at least 2 players' })); return; }
+        this.game = new GameEngine(names);
+        this.game.start();
+        this._broadcastState();
+        break;
       }
-      else if (action === 'take_discard') {
-        const success = this.game.takeDiscard(playerIndex);
-        if (success) ws.send(JSON.stringify({ type: 'your_draw', value: this.game.drawnCard }));
+
+      case 'action': {
+        if (!this.game) return;
+        const g = this.game;
+        const pi = g.players.findIndex(p => p.name === playerName);
+        if (pi < 0) return;
+
+        switch (msg.action) {
+          case 'reveal':               g.revealInitial(pi, msg.index); break;
+          case 'tiebreaker':           g.revealTiebreaker(pi, msg.index); break;
+          case 'draw_deck': {
+            const val = g.drawDeck(pi);
+            if (val !== null) conn.send(JSON.stringify({ type: 'your_draw', value: val, source: 'deck' }));
+            break;
+          }
+          case 'take_discard': {
+            const val = g.takeDiscard(pi); // returns the value that was on top
+            if (val !== null) conn.send(JSON.stringify({ type: 'your_draw', value: val, source: 'discard' }));
+            break;
+          }
+          case 'swap':                 g.swap(pi, msg.index); break;
+          case 'discard_drawn':        g.discardDrawn(pi); break;
+          case 'reveal_after_discard': g.revealAfterDiscard(pi, msg.index); break;
+          case 'next_round':
+            if (g.phase === 'ROUND_END' || g.phase === 'GAME_OVER') {
+              g.nextRound(); this._broadcastState(); return;
+            }
+            break;
+        }
+        this._broadcastState();
+        break;
       }
-      else if (action === 'reveal') this.game.revealInitial(playerIndex, data.index);
-      else if (action === 'tiebreaker') this.game.revealTiebreaker(playerIndex, data.index);
-      else if (action === 'swap') this.game.swap(playerIndex, data.index);
-      else if (action === 'discard_drawn') this.game.discardDrawnCard(playerIndex);
-      else if (action === 'reveal_after_discard') this.game.revealAfterDiscard(playerIndex, data.index);
-      else if (action === 'complete_turn_end') this.game.completeTurnEnd();
-      else if (action === 'next_round') this.game.nextRound();
 
-      this.saveState();
-      this.broadcastState();
+      case 'close_room': {
+        if (playerName === this.hostName) this._closeRoom('Host closed the room.');
+        break;
+      }
     }
   }
 
-  webSocketClose(ws, code, reason, wasClean) {
-    this.sessions = this.sessions.filter(s => s.ws !== ws);
-    if (this.game.phase === 'LOBBY' || this.game.phase === 'GAME_OVER') {
-      this.broadcastLobby();
-    }
+  onClose(conn) {
+    const playerName = conn.state?.name; if (!playerName) return;
+    delete this.lobby[playerName];
+    if (Object.keys(this.lobby).length === 0) return;
+    if (playerName === this.hostName) this.hostName = Object.keys(this.lobby)[0] ?? null;
+    this._broadcastLobby();
   }
 
-  saveState() {
-    this.state.storage.put("gameState", this.game);
+  async alarm() {
+    await this._closeRoom('Room closed due to inactivity.');
   }
 
-  broadcastState() {
-    const publicState = this.game.getPublicState();
-    this.broadcast({ type: 'state', state: publicState });
-  }
+  // ── helpers ──
 
-  broadcastLobby() {
-    this.broadcast({
+  _broadcastLobby() {
+    this.broadcast(JSON.stringify({
       type: 'lobby',
-      players: this.sessions.map(s => s.name),
-      hostName: this.sessions.length > 0 ? this.sessions[0].name : "",
-      isPublic: this.sessions.some(s => s.isPublic)
-    });
+      players: Object.keys(this.lobby),
+      hostName: this.hostName,
+      isPublic: this.isPublic,
+    }));
   }
 
-  broadcast(messageObj) {
-    const str = JSON.stringify(messageObj);
-    this.sessions.forEach(session => {
-      try { session.ws.send(str); } catch (err) {}
-    });
+  _broadcastState() {
+    if (!this.game) return;
+    const state = this.game.publicState();
+    this.broadcast(JSON.stringify({ type: 'state', state }));
+
+    // After broadcasting turn_end_delay, schedule completeTurnEnd
+    if (state.turnAction === 'turn_end_delay') {
+      this.ctx.waitUntil(
+        new Promise(r => setTimeout(r, TURN_DELAY_MS)).then(() => {
+          if (this.game?.turnAction === 'turn_end_delay') {
+            this.game.completeTurnEnd();
+            this._broadcastState();
+          }
+        })
+      );
+    }
+  }
+
+  async _closeRoom(reason) {
+    this.broadcast(JSON.stringify({ type: 'room_closed', reason }));
+    for (const conn of this.getConnections()) { try { conn.close(1000, reason); } catch {} }
+    await this.ctx.storage.deleteAlarm();
+    this.game = null; this.lobby = {}; this.hostName = null;
   }
 }
 
-// ============================================================================
-// MAIN WORKER ROUTER & CENTRAL PUBLIC REGISTRY
-// ============================================================================
+// ─── Main fetch handler ──────────────────────────────────────────────────────
+
 export default {
   async fetch(request, env) {
-    const url = new URL(request.url);
-
-    // Dynamic global CORS handling
-    if (request.method === "OPTIONS") {
-      return new Response(null, {
-        headers: {
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type"
-        }
-      });
+    // CORS preflight
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+        'Access-Control-Allow-Headers': '*',
+      }});
     }
 
-    // 1. Scanner API Endpoint: Gathers list of public lobby rooms
-    if (url.pathname === '/room-scanner') {
-      const publicRegistry = {};
-      
-      // Look up keys in KV store or state catalog. 
-      // If none, we crawl registered namespaces or active lists.
-      // Since DO list namespace is restricted, we query our state list.
-      let list = [];
-      try {
-        list = await env.GAME_ROOM.list();
-      } catch (e) {
-        // Fallback if not supported on platform
-      }
-      
-      // Because listing namespace can be limited on standard plans, 
-      // we utilize storage or active DO instance matching
-      const targetKeys = ["PUB1", "PUB2", "PUB3", "PUB4", "PUB5", "PUB6", "PUB7", "PUB8", "PUB9", "PUB0"];
-      // Generates a responsive mapped registry of active matches
-      for (const key of targetKeys) {
-         try {
-           const id = env.GAME_ROOM.idFromName(key);
-           const room = env.GAME_ROOM.get(id);
-           const details = await room.fetch(new Request(url.origin + `/room/${key}`));
-           if (details.ok) {
-             const data = await details.json();
-             if (data && data.players && data.players.length > 0 && !data.inGame) {
-               publicRegistry[key] = data;
-             }
-           }
-         } catch(e) {}
-      }
+    const response = await routePartykitRequest(request, env, {
+      cors: { origin: '*' },  // allow cross-origin WebSocket upgrades
+    }) ?? new Response('Not found', { status: 404 });
 
-      return new Response(JSON.stringify(publicRegistry), {
-        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
-      });
-    }
-
-    // 2. Active Gameplay Route Redirect
-    if (url.pathname.startsWith('/room/')) {
-      const parts = url.pathname.split('/');
-      const code = parts[2];
-      
-      if (!env.GAME_ROOM) {
-        return new Response(
-          "Server configuration error: GAME_ROOM Durable Object is not bound.", 
-          { status: 500, headers: {"Access-Control-Allow-Origin": "*"} }
-        );
-      }
-
-      const id = env.GAME_ROOM.idFromName(code);
-      const room = env.GAME_ROOM.get(id);
-      
-      let response = await room.fetch(request);
-      response = new Response(response.body, response);
-      response.headers.set("Access-Control-Allow-Origin", "*");
-      return response;
-    }
-
-    return new Response("Skyjo Pro Server online.", {
-        headers: {"Access-Control-Allow-Origin": "*"}
-    });
-  }
+    return response;
+  },
 };
