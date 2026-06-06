@@ -18,6 +18,9 @@ export const LOBBY_SINGLETON = "public-lobby";
 
 type ConnState = { pid?: string };
 interface Seat { id: string; name: string; connId: string | null; }
+interface Pending { id: string; name: string; } // late joiners waiting to be seated
+
+const IDLE_MS = 10 * 60 * 1000; // auto-close a room after 10 min of no activity
 
 /* ============================================================
    ROOM — one instance per game code
@@ -27,17 +30,21 @@ export class Room extends Server<Env> {
 
   engine: GameEngine | null = null;
   seats: Seat[] = [];
+  pending: Pending[] = []; // mid-game joiners spectating until next round
   hostId: string | null = null;
   isPublic = false;
   maxPlayers = 8;
+  lastActivity = Date.now();
 
   async onStart() {
     const meta = await this.ctx.storage.get<any>("meta");
     if (meta) {
       this.seats = meta.seats ?? [];
+      this.pending = meta.pending ?? [];
       this.hostId = meta.hostId ?? null;
       this.isPublic = meta.isPublic ?? false;
       this.maxPlayers = meta.maxPlayers ?? 8;
+      this.lastActivity = meta.lastActivity ?? Date.now();
     }
     const eng = await this.ctx.storage.get<any>("engine");
     if (eng) this.engine = GameEngine.fromJSON(eng);
@@ -45,13 +52,49 @@ export class Room extends Server<Env> {
 
   private async persist() {
     await this.ctx.storage.put("meta", {
-      seats: this.seats, hostId: this.hostId, isPublic: this.isPublic, maxPlayers: this.maxPlayers,
+      seats: this.seats, pending: this.pending, hostId: this.hostId,
+      isPublic: this.isPublic, maxPlayers: this.maxPlayers, lastActivity: this.lastActivity,
     });
     if (this.engine) await this.ctx.storage.put("engine", JSON.parse(JSON.stringify(this.engine)));
     else await this.ctx.storage.delete("engine");
   }
 
+  // Mark activity + (re)arm the idle-close alarm.
+  private touch() {
+    this.lastActivity = Date.now();
+    this.ctx.storage.setAlarm(Date.now() + IDLE_MS);
+  }
+
+  // Fired by the idle alarm. Close the room if it's empty or has gone idle.
+  async onAlarm() {
+    const live = [...this.getConnections()].length;
+    const idle = Date.now() - this.lastActivity >= IDLE_MS;
+    if (live === 0 || idle) {
+      // Tear down: drop from the public lobby and wipe storage so the code is reusable.
+      try { await this.updateLobby(true); } catch (_) {}
+      for (const c of this.getConnections()) { try { c.close(4000, "Room closed (inactive)."); } catch (_) {} }
+      await this.ctx.storage.deleteAll();
+      this.engine = null; this.seats = []; this.pending = []; this.hostId = null;
+    } else {
+      // Still alive — check again later.
+      this.ctx.storage.setAlarm(Date.now() + IDLE_MS);
+    }
+  }
+
   private seatIndexOf(pid: string) { return this.seats.findIndex((s) => s.id === pid); }
+  private pendingIndexOf(pid: string) { return this.pending.findIndex((s) => s.id === pid); }
+
+  // Move all spectating late-joiners into seats, starting at the average total score.
+  private seatPendingPlayers() {
+    if (!this.engine || !this.pending.length) return;
+    const avg = this.engine.averageTotal();
+    for (const p of this.pending) {
+      if (this.seats.length >= this.maxPlayers) break;
+      this.engine.addPlayer(p.name, avg);
+      this.seats.push({ id: p.id, name: p.name, connId: null });
+    }
+    this.pending = [];
+  }
 
   private async updateLobby(remove = false) {
     if (!this.isPublic) return;
@@ -63,8 +106,10 @@ export class Room extends Server<Env> {
           action: remove ? "remove" : "update",
           code: this.name,
           hostName: this.seats.find((s) => s.id === this.hostId)?.name ?? "?",
-          players: this.seats.length,
+          players: this.seats.length + this.pending.length,
           maxPlayers: this.maxPlayers,
+          // Public list still shows in-progress games (you can join to spectate),
+          // as long as there's room for another seat.
           inProgress: !!this.engine && this.engine.phase !== "ROUND_END",
         }),
       });
@@ -79,10 +124,12 @@ export class Room extends Server<Env> {
     const pid = conn.state?.pid;
     const seatIdx = pid ? this.seatIndexOf(pid) : -1;
     if (this.engine) {
+      const spectator = seatIdx < 0; // late joiner watching until next round
       conn.send(JSON.stringify({
         type: "state",
         seatIndex: seatIdx,
         isHost: pid === this.hostId,
+        spectator,
         state: this.engine.getStateFor(seatIdx),
       }));
     } else {
@@ -98,6 +145,8 @@ export class Room extends Server<Env> {
   }
 
   onConnect(conn: Connection<ConnState>, _ctx: ConnectionContext) {
+    // Ensure the idle-close alarm is armed whenever someone is connected.
+    this.ctx.storage.setAlarm(Date.now() + IDLE_MS);
     conn.send(JSON.stringify({ type: "hello" }));
   }
 
@@ -109,26 +158,40 @@ export class Room extends Server<Env> {
       const pid: string = msg.pid;
       const name: string = (msg.name || "Player").slice(0, 20);
       conn.setState({ pid });
+      this.touch();
 
       const idx = this.seatIndexOf(pid);
-      if (idx === -1) {
+      if (idx >= 0) {
+        // Reconnecting seated player.
+        this.seats[idx].name = name;
+        this.seats[idx].connId = conn.id;
+        if (this.engine) this.engine.players[idx].name = name;
+      } else if (this.engine) {
+        // Game in progress -> become a spectator, queued to be seated next round.
+        const pIdx = this.pendingIndexOf(pid);
+        if (pIdx >= 0) this.pending[pIdx].name = name;
+        else if (this.seats.length + this.pending.length < this.maxPlayers) {
+          this.pending.push({ id: pid, name });
+          conn.send(JSON.stringify({
+            type: "spectating",
+            message: "Game in progress — you'll join automatically next round.",
+          }));
+        } else {
+          conn.send(JSON.stringify({ type: "error", message: "Room is full." }));
+          return;
+        }
+      } else {
+        // Pre-game lobby.
         if (this.seats.length === 0) {
           this.hostId = pid;
           this.isPublic = !!msg.isPublic;
           this.maxPlayers = msg.maxPlayers || 8;
         }
-        if (this.engine) {
-          conn.send(JSON.stringify({ type: "error", message: "Game already in progress." }));
-        } else if (this.seats.length >= this.maxPlayers) {
+        if (this.seats.length >= this.maxPlayers) {
           conn.send(JSON.stringify({ type: "error", message: "Room is full." }));
           return;
-        } else {
-          this.seats.push({ id: pid, name, connId: conn.id });
         }
-      } else {
-        this.seats[idx].name = name;
-        this.seats[idx].connId = conn.id;
-        if (this.engine) this.engine.players[idx].name = name;
+        this.seats.push({ id: pid, name, connId: conn.id });
       }
       await this.persist();
       await this.updateLobby();
@@ -145,6 +208,7 @@ export class Room extends Server<Env> {
         conn.send(JSON.stringify({ type: "error", message: "Need at least 2 players." }));
         return;
       }
+      this.touch();
       this.engine = new GameEngine(this.seats.map((s) => s.name));
       this.engine.start();
       await this.persist();
@@ -154,10 +218,15 @@ export class Room extends Server<Env> {
     }
 
     if (msg.type === "next_round" && pid === this.hostId && this.engine) {
+      this.touch();
       if (this.engine.phase === "GAME_OVER") {
+        // Fresh game: seat spectators (avg score is 0 here) and rebuild from all seats.
+        this.seatPendingPlayers();
         this.engine = new GameEngine(this.seats.map((s) => s.name));
         this.engine.start();
       } else if (this.engine.phase === "ROUND_END") {
+        // Seat late joiners at the current average total, then deal the next round.
+        this.seatPendingPlayers();
         this.engine.nextRound();
       }
       await this.persist();
@@ -175,6 +244,7 @@ export class Room extends Server<Env> {
     }
 
     if (msg.type === "action" && this.engine && seatIdx >= 0) {
+      this.touch();
       const g = this.engine; const i = seatIdx;
       switch (msg.action) {
         case "reveal": g.revealInitial(i, msg.index); break;
@@ -197,14 +267,23 @@ export class Room extends Server<Env> {
     const idx = this.seatIndexOf(pid);
     if (idx >= 0) this.seats[idx].connId = null;
 
+    // A spectating late-joiner left before being seated -> drop them from the queue.
+    const pIdx = this.pendingIndexOf(pid);
+    if (pIdx >= 0) { this.pending.splice(pIdx, 1); }
+
     // Pre-game: free the seat so the lobby stays accurate.
     if (!this.engine && idx >= 0) {
       this.seats.splice(idx, 1);
       if (pid === this.hostId) this.hostId = this.seats[0]?.id ?? null;
-      await this.persist();
-      await this.updateLobby(this.seats.length === 0);
-      this.broadcastState();
     }
+
+    await this.persist();
+    await this.updateLobby(this.seats.length === 0 && this.pending.length === 0);
+    this.broadcastState();
+
+    // If nobody is connected anymore, close soon (also covered by the idle alarm).
+    const live = [...this.getConnections()].filter((c) => c.id !== conn.id).length;
+    if (live === 0) this.ctx.storage.setAlarm(Date.now() + 30_000);
   }
 }
 
@@ -229,9 +308,10 @@ export class Lobby extends Server<Env> {
   }
   private list() {
     this.prune();
+    // Show joinable rooms: open seats OR in-progress games you can spectate.
     return Object.values(this.rooms)
-      .filter((r) => !r.inProgress && r.players < r.maxPlayers)
-      .sort((a, b) => b.updatedAt - a.updatedAt);
+      .filter((r) => r.players < r.maxPlayers)
+      .sort((a, b) => Number(a.inProgress) - Number(b.inProgress) || b.updatedAt - a.updatedAt);
   }
   private broadcastList() {
     this.broadcast(JSON.stringify({ type: "rooms", rooms: this.list() }));

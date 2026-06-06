@@ -39,17 +39,37 @@ Make sure these are committed: `src/`, `public/`, `wrangler.jsonc`, `package.jso
 
 ## Step 2 — Create the Worker from Git in the Cloudflare dashboard
 
+> ⚠️ **MOST COMMON MISTAKE:** if `wrangler.jsonc` lives in a `skyjo/` subfolder of
+> your repo (it does, in this project), you **must** set **Root directory = `skyjo`**.
+> Otherwise the build runs at the repo root, can't find `wrangler.jsonc` or `public/`,
+> and fails with *"Could not detect a directory containing static files."*
+
 1. Go to **dash.cloudflare.com** → **Workers & Pages**.
 2. Click **Create application** → **Workers** tab → **Import a repository**
    (a.k.a. *Connect to Git*). Authorize GitHub if prompted and pick your repo.
 3. On the build settings screen set:
    - **Project / Worker name:** `skyjo-pro`
      *(must match `name` in `wrangler.jsonc`)*
-   - **Build command:** `npm install` *(or leave blank — install runs automatically)*
+   - **Root directory:** **`skyjo`**  ← the folder that contains `wrangler.jsonc`
+     *(leave as `/` only if you committed `wrangler.jsonc` at the repo root)*
+   - **Build command:** `npm install`
    - **Deploy command:** `npx wrangler deploy`
-   - **Root directory:** `/` (or `skyjo` if you committed the whole workspace and this
-     folder is a subdirectory of the repo)
 4. Click **Save and Deploy**.
+
+### Already created the Worker and it failed?
+Don't recreate it. Go to your Worker → **Settings → Build → Build configuration →
+Edit**, set **Root directory = `skyjo`**, **Build command = `npm install`**,
+**Deploy command = `npx wrangler deploy`**, save, then **Retry deployment**.
+
+**Alternative** (if you can't/won't change Root directory): keep root `/` and set the
+**Deploy command** to run from the subfolder instead:
+
+```
+cd skyjo && npm install && npx wrangler deploy
+```
+
+Either way, `npm install` must run so your pinned wrangler from `package-lock.json` is
+used — if you see the build *installing* `wrangler@4.x` on the fly, install didn't run.
 
 Cloudflare runs the build, reads `wrangler.jsonc`, creates the two Durable Object
 namespaces (`Room`, `Lobby`) with the SQLite migration, uploads `public/` as static
@@ -62,6 +82,20 @@ page share that origin automatically; **nothing to configure**.
 > **Every future `git push` to `main` auto-deploys.** Pull requests get preview URLs.
 
 ---
+
+## Features
+
+- **Sound** — playful arcade SFX generated in-browser (WebAudio, no files). On by
+  default; tap 🔊 in the game top bar to mute (persists). Audio unlocks on first tap
+  (browser autoplay rule).
+- **Mobile-first layout** — card sizes scale via CSS `clamp()`; opponent boards are a
+  horizontally-scrollable strip on phones and wrap centered on desktop. Sticky top bar,
+  safe-area aware, no overflow.
+- **Drop-in / spectate** — you can join a public game already in progress. You'll
+  **spectate** the current round, then be seated automatically at the **average total
+  score** of active players when the next round starts.
+- **Auto-close rooms** — a room shuts down after **10 minutes of inactivity** or once
+  everyone has left (Durable Object alarm), freeing the code for reuse.
 
 ## Step 3 — Play
 

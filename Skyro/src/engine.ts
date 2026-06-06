@@ -71,6 +71,23 @@ export class GameEngine {
   nextRound() { this.round++; this.deal(); }
   newGame() { this.round = 1; for (const p of this.players) p.totalScore = 0; this.deal(); }
 
+  // Add a player mid-game (e.g. a late joiner who spectated). They start with the
+  // supplied total score (typically the average of active players, rounded).
+  // Their board is dealt on the next deal()/nextRound().
+  addPlayer(name: string, startingTotal: number) {
+    this.players.push({
+      name,
+      board: Array.from({ length: 12 }, () => ({ value: 0, revealed: false, cleared: false })),
+      roundScore: 0,
+      totalScore: Math.round(startingTotal) || 0,
+      revealCount: 0,
+    });
+  }
+  averageTotal(): number {
+    if (!this.players.length) return 0;
+    return this.players.reduce((s, p) => s + p.totalScore, 0) / this.players.length;
+  }
+
   revealInitial(pi: number, ci: number): boolean {
     if (this.phase !== "REVEAL") return false;
     const p = this.players[pi]; if (!p || p.revealCount >= 2) return false;
